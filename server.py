@@ -1,68 +1,76 @@
-import os
-import json
-import hmac
-import hashlib
-from flask import Flask, request, render_template, jsonify
+from flask import Flask, request, jsonify, render_template
 from pymongo import MongoClient
 from dotenv import load_dotenv
+import razorpay
+import os
+import hashlib
+import hmac
+import json
 from datetime import datetime
+from flask_cors import CORS
 
+# Load environment variables
 load_dotenv()
 
-app = Flask(__name__)
-
-# Load env variables
 MONGO_URI = os.getenv("MONGO_URI")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 PORT = int(os.getenv("PORT", 5000))
 
-# Connect to MongoDB
+# Flask App Setup
+app = Flask(__name__)
+CORS(app)
+
+# MongoDB Connection
 client = MongoClient(MONGO_URI)
-db = client['ram']
-collection = db['raj']
+db = client["ram"]
+collection = db["raj"]
 
-# Routes
+# Home route
 @app.route('/')
-def index():
-    return render_template('index.html')
+def home():
+    return render_template("index.html")
 
+# Get names
+@app.route('/get-names', methods=['GET'])
+def get_names():
+    names = list(collection.find({}, {'_id': 0}))
+    names_sorted = sorted(names, key=lambda x: x['order'])
+    return jsonify(names_sorted)
+
+# Razorpay Webhook
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    # Verify Razorpay signature
-    received_sig = request.headers.get('X-Razorpay-Signature')
-    body = request.data.decode('utf-8')
-    expected_sig = hmac.new(WEBHOOK_SECRET.encode(), body.encode(), hashlib.sha256).hexdigest()
+    payload = request.data
+    signature = request.headers.get('X-Razorpay-Signature')
 
-    if received_sig != expected_sig:
-        return jsonify({'status': 'invalid signature'}), 400
+    # Verify signature
+    expected = hmac.new(
+        bytes(WEBHOOK_SECRET, 'utf-8'),
+        msg=payload,
+        digestmod=hashlib.sha256
+    ).hexdigest()
 
-    payload = json.loads(body)
-    if payload['event'] == 'payment.captured':
-        payment_id = payload['payload']['payment']['entity']['id']
+    if hmac.compare_digest(expected, signature):
+        data = json.loads(payload)
+        if data['event'] == 'payment.captured':
+            notes = data['payload']['payment']['entity'].get('notes', {})
+            name = notes.get('name')
+            place = notes.get('place')
 
-        # Assuming Name & Place are passed as notes
-        name = payload['payload']['payment']['entity'].get('notes', {}).get('name', 'Anonymous')
-        place = payload['payload']['payment']['entity'].get('notes', {}).get('place', 'Unknown')
-
-        timestamp = datetime.utcnow()
-        order = collection.count_documents({}) + 1
-
-        collection.insert_one({
-            'payment_id': payment_id,
-            'name': name,
-            'place': place,
-            'timestamp': timestamp,
-            'order': order
-        })
-
-        return jsonify({'status': 'success'}), 200
-
-    return jsonify({'status': 'ignored'}), 200
-
-@app.route('/get-names')
-def get_names():
-    names = list(collection.find({}, {'_id': 0}).sort('order', 1))
-    return jsonify(names)
+            if name and place:
+                count = collection.count_documents({})
+                document = {
+                    "payment_id": data['payload']['payment']['entity']['id'],
+                    "name": name,
+                    "place": place,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "order": count + 1
+                }
+                collection.insert_one(document)
+                return jsonify({"status": "success"}), 200
+        return jsonify({"status": "ignored"}), 200
+    else:
+        return jsonify({"status": "unauthorized"}), 400
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=PORT)
